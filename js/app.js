@@ -18,6 +18,11 @@ let farmState = {
   connectionMode: (function() {
     const saved = localStorage.getItem('samposhi_conn_mode');
     if (saved) return saved;
+    if (typeof window !== 'undefined' && window.location) {
+      if (window.location.protocol === 'https:' || (window.location.hostname && window.location.hostname.includes('.github.io'))) {
+        return 'remote';
+      }
+    }
     return 'local';
   })(),
   mqttConnected: false,
@@ -290,6 +295,12 @@ function getTargetGatewayHost() {
     if (saved.endsWith('/')) saved = saved.slice(0, -1);
     return saved;
   }
+  if (typeof window !== 'undefined' && window.location && window.location.hostname) {
+    const hn = window.location.hostname;
+    if (hn && hn !== 'localhost' && hn !== '127.0.0.1' && !hn.includes('.github.io') && !hn.includes('netlify.app') && !hn.includes('vercel.app')) {
+      return hn;
+    }
+  }
   if (typeof farmState !== 'undefined' && farmState.staConnected && farmState.staIP && farmState.staIP !== '0.0.0.0') {
     return farmState.staIP;
   }
@@ -299,43 +310,57 @@ function getTargetGatewayHost() {
 const _nativeFetch = window.fetch;
 window.fetch = async function(url, options) {
   const activeMode = (typeof farmState !== 'undefined' && farmState.connectionMode) || localStorage.getItem('samposhi_conn_mode') || 'local';
-  if (activeMode === 'local') {
-    let reqUrl = url;
-    if (typeof url === 'string' && (url.startsWith('/') || url.startsWith('api/'))) {
-      const path = url.startsWith('/') ? url : `/${url}`;
-      const targetHost = getTargetGatewayHost();
-      if (typeof window !== 'undefined' && window.location && window.location.hostname !== targetHost) {
-        reqUrl = `http://${targetHost}${path}`;
-      }
+
+  let reqUrl = url;
+  let isApiCall = false;
+  if (typeof url === 'string' && (url.startsWith('/') || url.startsWith('api/'))) {
+    isApiCall = true;
+    const path = url.startsWith('/') ? url : `/${url}`;
+    const targetHost = getTargetGatewayHost();
+    if (typeof window !== 'undefined' && window.location && window.location.hostname === targetHost) {
+      reqUrl = path;
+    } else {
+      reqUrl = `http://${targetHost}${path}`;
     }
+  }
+
+  // A. LOCAL MODE: Direct cleartext HTTP to Gateway
+  if (activeMode === 'local') {
     return _nativeFetch(reqUrl, options);
   }
 
-  // Cloud Remote MQTT Interception
-  if (typeof url === 'string') {
-    if (url.includes('/api/status')) {
-      return new Response(JSON.stringify(farmState || {}), { status: 200, headers: { 'Content-Type': 'application/json' } });
-    }
-
+  // B. REMOTE CLOUD MODE: Cloud MQTT Interception + Concurrent Local Fast Dispatch
+  if (typeof url === 'string' && isApiCall) {
     let body = {};
     if (options && options.body) {
       try { body = JSON.parse(options.body); } catch (e) {}
     }
 
-    // Fast local opportunistic dispatch:
-    // If phone is in range of Master Hotspot or farm Wi-Fi, fire direct local HTTP concurrently.
-    // Master executes CMD_INSTANT locally in <10ms, while Cloud MQTT synchronizes remote brokers.
-    if (!url.includes('/api/status')) {
+    // Status request in Remote mode:
+    if (url.includes('/api/status')) {
       try {
-        const targetHost = getTargetGatewayHost();
-        const path = url.startsWith('/') ? url : `/${url}`;
-        const localTarget = `http://${targetHost}${path}`;
+        const localHost = getTargetGatewayHost();
+        const localUrl = `http://${localHost}/api/status?_t=${Date.now()}`;
         const ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
-        if (ctrl) setTimeout(() => ctrl.abort(), 1200);
-        _nativeFetch(localTarget, Object.assign({}, options, { signal: ctrl ? ctrl.signal : undefined })).catch(() => {});
+        const tid = ctrl ? setTimeout(() => ctrl.abort(), 1200) : null;
+        const lRes = await _nativeFetch(localUrl, { cache: 'no-store', signal: ctrl ? ctrl.signal : undefined });
+        if (tid) clearTimeout(tid);
+        if (lRes.ok) return lRes;
       } catch (e) {}
+      return new Response(JSON.stringify(farmState || {}), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
 
+    // Fast local opportunistic dispatch for control commands (concurrent <15ms trigger)
+    try {
+      const localHost = getTargetGatewayHost();
+      const path = url.startsWith('/') ? url : `/${url}`;
+      const localTarget = `http://${localHost}${path}`;
+      const ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+      if (ctrl) setTimeout(() => ctrl.abort(), 1500);
+      _nativeFetch(localTarget, Object.assign({}, options, { signal: ctrl ? ctrl.signal : undefined })).catch(() => {});
+    } catch (e) {}
+
+    // Cloud MQTT command topic
     if (url.includes('/api/all')) {
       sendCloudMqttCommand({ cmd: "all", on: body.on });
     } else if (url.includes('/api/auto-all')) {
@@ -349,10 +374,9 @@ window.fetch = async function(url, options) {
         if (body.auto) {
           sendCloudMqttCommand({ cmd: "zone_auto", zoneId: body.zoneId });
         } else {
-          sendCloudMqttCommand({ cmd: "zone_pwm", zoneId: body.zoneId, pwm: body.pwm !== undefined ? body.pwm : (activeZoneDetail ? activeZoneDetail.pwm : 0) });
+          sendCloudMqttCommand({ cmd: "zone_pwm", zoneId: body.zoneId, pwm: body.pwm !== undefined ? body.pwm : 0 });
         }
       } else if (body.on !== undefined && (body.pwm === undefined || body.pwm === 0 || body.pwm === 1023)) {
-        // Direct instant power switch on Master (CMD_INSTANT)
         sendCloudMqttCommand({ cmd: "zone_power", zoneId: body.zoneId, on: body.on });
       } else if (body.pwm !== undefined) {
         sendCloudMqttCommand({ cmd: "zone_pwm", zoneId: body.zoneId, pwm: body.pwm });
@@ -400,7 +424,7 @@ window.fetch = async function(url, options) {
 function applyGatewayData(data) {
   if (!data) return;
   const themes = ["rose", "cyan", "yellow", "green"];
-  if (Array.isArray(data.zones)) {
+  if (Array.isArray(data.zones) && data.zones.length > 0) {
     data.zones.forEach((z, idx) => {
       const existing = farmState.zones ? farmState.zones.find(ez => ez.id === z.id) : null;
       if (!z.theme) z.theme = (existing && existing.theme) ? existing.theme : themes[idx % themes.length];
@@ -414,8 +438,15 @@ function applyGatewayData(data) {
       const updatedActive = data.zones.find(z => z.id === activeZoneDetail.id);
       if (updatedActive) activeZoneDetail = updatedActive;
     }
+    farmState.zones = data.zones;
   }
-  farmState = Object.assign({}, farmState, data);
+  if (Array.isArray(data.slaves) && data.slaves.length > 0) {
+    farmState.slaves = data.slaves;
+  }
+  const copy = Object.assign({}, data);
+  delete copy.zones;
+  delete copy.slaves;
+  farmState = Object.assign({}, farmState, copy);
   parseMasterTime(data);
 }
 
@@ -480,7 +511,7 @@ function getAmbientLightLevelPct() {
 async function fetchStatus(force = false) {
   if (!force && pausePollingTimer) return;
   const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
-  const timeoutId = controller ? setTimeout(() => controller.abort(), 2500) : null;
+  const timeoutId = controller ? setTimeout(() => controller.abort(), 5000) : null;
   try {
     const fetchOpts = { cache: 'no-store' };
     if (controller) fetchOpts.signal = controller.signal;
@@ -492,13 +523,17 @@ async function fetchStatus(force = false) {
       applyGatewayData(data);
       renderAll();
     } else {
-      farmState.masterOnline = false;
-      renderHeader();
+      if (force || !farmState.zones || farmState.zones.length === 0) {
+        farmState.masterOnline = false;
+        renderHeader();
+      }
     }
   } catch (e) {
     if (timeoutId) clearTimeout(timeoutId);
-    farmState.masterOnline = false;
-    renderHeader();
+    if (force || !farmState.zones || farmState.zones.length === 0) {
+      farmState.masterOnline = false;
+      renderHeader();
+    }
   }
 }
 
@@ -1782,11 +1817,9 @@ async function onRadialSliderChange(pctVal) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ zoneId: activeZoneDetail.id, pwm: pwm })
   }).then(res => {
-    if (!res.ok) throw new Error('Action failed');
-    showToast(`${activeZoneDetail.name} set to ${pct}% (${pwm} PWM)`);
+    if (res.ok) showToast(`${activeZoneDetail.name} set to ${pct}% (${pwm} PWM)`);
   }).catch(e => {
-    showToast('Action failed', true);
-    fetchStatus(true);
+    console.warn('Zone slider notice:', e);
   });
 }
 
@@ -1864,7 +1897,7 @@ function updateSubcontrolToggles(zone) {
 
 async function toggleZoneAuto() {
   if (!activeZoneDetail) return;
-  pausePolling(4000);
+  pausePolling(3000);
   const newAuto = !(activeZoneDetail.mode === 'AUTO');
   activeZoneDetail.mode = newAuto ? 'AUTO' : 'MANUAL';
   updateSubcontrolToggles(activeZoneDetail);
@@ -1876,17 +1909,15 @@ async function toggleZoneAuto() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ zoneId: activeZoneDetail.id, auto: newAuto })
   }).then(res => {
-    if (!res.ok) throw new Error('Action failed');
-    showToast(`${activeZoneDetail.name} mode: ${activeZoneDetail.mode}`);
+    if (res.ok) showToast(`${activeZoneDetail.name} mode: ${activeZoneDetail.mode}`);
   }).catch(e => {
-    showToast('Action failed', true);
-    fetchStatus(true);
+    console.warn('Zone auto notice:', e);
   });
 }
 
 async function toggleZoneEco() {
   if (!activeZoneDetail) return;
-  pausePolling(4000);
+  pausePolling(3000);
   const ecoPwm = LightingEngine.percentToPwm(50);
   activeZoneDetail.pwm = ecoPwm;
   activeZoneDetail.mode = 'MANUAL';
@@ -1900,11 +1931,9 @@ async function toggleZoneEco() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ zoneId: activeZoneDetail.id, pwm: ecoPwm })
   }).then(res => {
-    if (!res.ok) throw new Error('Action failed');
-    showToast(`${activeZoneDetail.name} preset: 50%`);
+    if (res.ok) showToast(`${activeZoneDetail.name} preset: 50%`);
   }).catch(e => {
-    showToast('Action failed', true);
-    fetchStatus(true);
+    console.warn('Zone eco notice:', e);
   });
 }
 
@@ -1922,7 +1951,7 @@ async function strobeCurrentZone() {
 
 async function toggleZonePowerMaster() {
   if (!activeZoneDetail) return;
-  pausePolling(4000);
+  pausePolling(3000);
   const isCurrentlyOn = (activeZoneDetail.power !== false && activeZoneDetail.pwm > 0);
   const newPwm = isCurrentlyOn ? 0 : 1023;
   activeZoneDetail.pwm = newPwm;
@@ -1950,18 +1979,16 @@ async function toggleZonePowerMaster() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ zoneId: activeZoneDetail.id, on: !isCurrentlyOn, pwm: newPwm })
   }).then(res => {
-    if (!res.ok) throw new Error('Action failed');
-    showToast(`${activeZoneDetail.name} turned ${!isCurrentlyOn ? 'ON' : 'OFF'}`);
+    if (res.ok) showToast(`${activeZoneDetail.name} turned ${!isCurrentlyOn ? 'ON' : 'OFF'}`);
   }).catch(e => {
-    showToast('Action failed', true);
-    fetchStatus(true);
+    console.warn('Zone power notice:', e);
   });
 }
 
 async function toggleDevicePower(nodeId) {
   const slave = farmState.slaves.find(s => s.nodeId === nodeId);
   if (!slave) return;
-  pausePolling(4000);
+  pausePolling(3000);
   const isCurrentlyOn = (slave.pwm > 0);
   const newPwm = isCurrentlyOn ? 0 : 1023;
   slave.pwm = newPwm;
@@ -1973,16 +2000,14 @@ async function toggleDevicePower(nodeId) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ nodeId: nodeId, on: !isCurrentlyOn })
   }).then(res => {
-    if (!res.ok) throw new Error('Action failed');
-    showToast(`${slave.name} turned ${!isCurrentlyOn ? 'ON' : 'OFF'}`);
+    if (res.ok) showToast(`${slave.name} turned ${!isCurrentlyOn ? 'ON' : 'OFF'}`);
   }).catch(e => {
-    showToast('Action failed', true);
-    fetchStatus(true);
+    console.warn('Fixture power notice:', e);
   });
 }
 
 async function setGlobalAll(on) {
-  pausePolling(4000);
+  pausePolling(3000);
   if (farmState.zones) {
     farmState.zones.forEach(z => {
       z.mode = 'MANUAL';
@@ -2010,16 +2035,14 @@ async function setGlobalAll(on) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ on: on })
   }).then(res => {
-    if (!res.ok) throw new Error('Action failed');
-    showToast(`All fixtures turned ${on ? 'ON (100%)' : 'OFF (0%)'}`);
+    if (res.ok) showToast(`All fixtures turned ${on ? 'ON (100%)' : 'OFF (0%)'}`);
   }).catch(e => {
-    showToast('Action failed', true);
-    fetchStatus(true);
+    console.warn('Global all notice:', e);
   });
 }
 
 async function restoreGlobalAuto() {
-  pausePolling(4000);
+  pausePolling(3000);
   if (farmState.zones) {
     farmState.zones.forEach(z => { z.mode = 'AUTO'; });
     if (activeZoneDetail) {
@@ -2034,11 +2057,9 @@ async function restoreGlobalAuto() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ auto: true })
   }).then(res => {
-    if (!res.ok) throw new Error('Action failed');
-    showToast("Restored Photoperiod AUTO mode across all zones");
+    if (res.ok) showToast("Restored Photoperiod AUTO mode across all zones");
   }).catch(e => {
-    showToast('Action failed', true);
-    fetchStatus(true);
+    console.warn('Restore auto notice:', e);
   });
 }
 
@@ -3145,11 +3166,13 @@ window.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  // Connect to Local by default on open; switch to Remote if configured
+  // Initialize active transport on open
   if (farmState.connectionMode === 'remote') {
     startCloudMqtt();
+    fetchStatus(true);
+    if (!pollTimer) pollTimer = setInterval(fetchStatus, 4000);
   } else {
     fetchStatus(true);
-    pollTimer = setInterval(fetchStatus, 3500);
+    if (!pollTimer) pollTimer = setInterval(fetchStatus, 3500);
   }
 });
