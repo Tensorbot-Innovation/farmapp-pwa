@@ -18,13 +18,7 @@ let farmState = {
   connectionMode: (function() {
     const saved = localStorage.getItem('samposhi_conn_mode');
     if (saved) return saved;
-    if (typeof window !== 'undefined' && window.location && (
-      window.location.hostname === '192.168.4.1' ||
-      window.location.hostname.endsWith('.local')
-    )) {
-      return 'local';
-    }
-    return 'remote';
+    return 'local';
   })(),
   mqttConnected: false,
   mqttBroker: localStorage.getItem('samposhi_mqtt_host') || "broker.emqx.io",
@@ -48,9 +42,18 @@ let farmState = {
 
 let currentTab = 'home';
 let activeZoneDetail = null;
-let currentConnMode = localStorage.getItem('samposhi_conn_mode') || 'remote';
+let currentConnMode = localStorage.getItem('samposhi_conn_mode') || 'local';
 let appMqttClient = null;
 let pollTimer = null;
+let pausePollingTimer = null;
+
+function pausePolling(ms = 4000) {
+  if (pausePollingTimer) clearTimeout(pausePollingTimer);
+  pausePollingTimer = setTimeout(() => {
+    pausePollingTimer = null;
+  }, ms);
+}
+
 let selectedOtaFile = null;
 let fleetViewMode = 'matrix';
 let currentInspectingNodeId = null;
@@ -279,19 +282,30 @@ function stopCloudMqtt() {
   renderSettingsTab();
 }
 
+function getTargetGatewayHost() {
+  let saved = (localStorage.getItem('samposhi_local_ip') || '').trim();
+  if (saved) {
+    if (saved.startsWith('http://')) saved = saved.slice(7);
+    if (saved.startsWith('https://')) saved = saved.slice(8);
+    if (saved.endsWith('/')) saved = saved.slice(0, -1);
+    return saved;
+  }
+  if (typeof farmState !== 'undefined' && farmState.staConnected && farmState.staIP && farmState.staIP !== '0.0.0.0') {
+    return farmState.staIP;
+  }
+  return '192.168.4.1';
+}
+
 const _nativeFetch = window.fetch;
 window.fetch = async function(url, options) {
-  const activeMode = (typeof farmState !== 'undefined' && farmState.connectionMode) || localStorage.getItem('samposhi_conn_mode') || 'remote';
+  const activeMode = (typeof farmState !== 'undefined' && farmState.connectionMode) || localStorage.getItem('samposhi_conn_mode') || 'local';
   if (activeMode === 'local') {
     let reqUrl = url;
     if (typeof url === 'string' && (url.startsWith('/') || url.startsWith('api/'))) {
       const path = url.startsWith('/') ? url : `/${url}`;
-      let savedHost = (localStorage.getItem('samposhi_local_ip') || '192.168.4.1').trim();
-      if (savedHost.startsWith('http://')) savedHost = savedHost.slice(7);
-      if (savedHost.startsWith('https://')) savedHost = savedHost.slice(8);
-      if (savedHost.endsWith('/')) savedHost = savedHost.slice(0, -1);
-      if (window.location.hostname !== savedHost) {
-        reqUrl = `http://${savedHost}${path}`;
+      const targetHost = getTargetGatewayHost();
+      if (typeof window !== 'undefined' && window.location && window.location.hostname !== targetHost) {
+        reqUrl = `http://${targetHost}${path}`;
       }
     }
     return _nativeFetch(reqUrl, options);
@@ -309,19 +323,15 @@ window.fetch = async function(url, options) {
     }
 
     // Fast local opportunistic dispatch:
-    // If the phone happens to be in range of the farm Wi-Fi or Master hotspot (192.168.4.1),
-    // fire a direct local HTTP request concurrently. If reachable, the Master executes CMD_INSTANT
-    // in <10ms with ZERO delay, while Cloud MQTT keeps remote telemetry in sync!
+    // If phone is in range of Master Hotspot or farm Wi-Fi, fire direct local HTTP concurrently.
+    // Master executes CMD_INSTANT locally in <10ms, while Cloud MQTT synchronizes remote brokers.
     if (!url.includes('/api/status')) {
       try {
-        let savedHost = (localStorage.getItem('samposhi_local_ip') || '192.168.4.1').trim();
-        if (savedHost.startsWith('http://')) savedHost = savedHost.slice(7);
-        if (savedHost.startsWith('https://')) savedHost = savedHost.slice(8);
-        if (savedHost.endsWith('/')) savedHost = savedHost.slice(0, -1);
+        const targetHost = getTargetGatewayHost();
         const path = url.startsWith('/') ? url : `/${url}`;
-        const localTarget = `http://${savedHost}${path}`;
+        const localTarget = `http://${targetHost}${path}`;
         const ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
-        if (ctrl) setTimeout(() => ctrl.abort(), 800);
+        if (ctrl) setTimeout(() => ctrl.abort(), 1200);
         _nativeFetch(localTarget, Object.assign({}, options, { signal: ctrl ? ctrl.signal : undefined })).catch(() => {});
       } catch (e) {}
     }
@@ -341,6 +351,9 @@ window.fetch = async function(url, options) {
         } else {
           sendCloudMqttCommand({ cmd: "zone_pwm", zoneId: body.zoneId, pwm: body.pwm !== undefined ? body.pwm : (activeZoneDetail ? activeZoneDetail.pwm : 0) });
         }
+      } else if (body.on !== undefined && (body.pwm === undefined || body.pwm === 0 || body.pwm === 1023)) {
+        // Direct instant power switch on Master (CMD_INSTANT)
+        sendCloudMqttCommand({ cmd: "zone_power", zoneId: body.zoneId, on: body.on });
       } else if (body.pwm !== undefined) {
         sendCloudMqttCommand({ cmd: "zone_pwm", zoneId: body.zoneId, pwm: body.pwm });
       } else if (body.on !== undefined) {
@@ -464,9 +477,10 @@ function getAmbientLightLevelPct() {
   return null;
 }
 
-async function fetchStatus() {
+async function fetchStatus(force = false) {
+  if (!force && pausePollingTimer) return;
   const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
-  const timeoutId = controller ? setTimeout(() => controller.abort(), 4000) : null;
+  const timeoutId = controller ? setTimeout(() => controller.abort(), 2500) : null;
   try {
     const fetchOpts = { cache: 'no-store' };
     if (controller) fetchOpts.signal = controller.signal;
@@ -1251,13 +1265,13 @@ function toggleConnectionMode() {
     currentConnMode = 'local';
     localStorage.setItem('samposhi_conn_mode', 'local');
     stopCloudMqtt();
-    const savedIp = localStorage.getItem('samposhi_local_ip') || '192.168.4.1';
+    const savedIp = getTargetGatewayHost();
     renderHeader();
     renderHeroBanners();
     showToast(`Switched to Local Direct Mode (${savedIp})`);
-    fetchStatus();
+    fetchStatus(true);
     if (!pollTimer) {
-      pollTimer = setInterval(fetchStatus, 2500);
+      pollTimer = setInterval(fetchStatus, 3500);
     }
   } else {
     // Switch to Remote Mode
@@ -1296,7 +1310,7 @@ function selectConnectionModeFromModal(mode) {
     if (localSection) localSection.style.display = 'block';
     if (remoteSection) remoteSection.style.display = 'none';
     if (btnSaveTxt) btnSaveTxt.textContent = 'Save & Use Local Direct';
-    const savedIp = localStorage.getItem('samposhi_local_ip') || '192.168.4.1';
+    const savedIp = getTargetGatewayHost();
     logRemoteTerminal(`Active transport set to: Local Gateway Direct (http://${savedIp})`, "sys");
   } else {
     if (localSection) localSection.style.display = 'none';
@@ -1421,8 +1435,8 @@ async function saveAndConnectRemoteModal() {
     }
     stopCloudMqtt();
     closeRemoteConnectionModal();
-    fetchStatus();
-    if (!pollTimer) pollTimer = setInterval(fetchStatus, 2500);
+    fetchStatus(true);
+    if (!pollTimer) pollTimer = setInterval(fetchStatus, 3500);
     return;
   }
 
@@ -1741,24 +1755,39 @@ function onRadialSliderInput(pctVal) {
 
 async function onRadialSliderChange(pctVal) {
   if (!activeZoneDetail) return;
+  pausePolling(4000);
   const pct = parseInt(pctVal, 10);
   const pwm = LightingEngine.percentToPwm(pct);
   activeZoneDetail.pwm = pwm;
   activeZoneDetail.mode = 'MANUAL';
   activeZoneDetail.power = (pct > 0);
+
+  // Optimistically sync fixtures in this zone
+  if (farmState.slaves) {
+    farmState.slaves.forEach(s => {
+      if (s.zoneId === activeZoneDetail.id) {
+        s.pwm = pwm;
+        s.on = (pwm > 0);
+      }
+    });
+  }
+
   updateSubcontrolToggles(activeZoneDetail);
   renderHeroBanners();
   renderBentoZones();
+  renderFleetViews();
 
-  try {
-    await fetch('/api/zone', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ zoneId: activeZoneDetail.id, pwm: pwm })
-    });
+  fetch('/api/zone', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ zoneId: activeZoneDetail.id, pwm: pwm })
+  }).then(res => {
+    if (!res.ok) throw new Error('Action failed');
     showToast(`${activeZoneDetail.name} set to ${pct}% (${pwm} PWM)`);
-    fetchStatus();
-  } catch (e) {}
+  }).catch(e => {
+    showToast('Action failed', true);
+    fetchStatus(true);
+  });
 }
 
 function setupRadialGaugeTouch() {
@@ -1792,11 +1821,15 @@ function setupRadialGaugeTouch() {
 
   wrapper.addEventListener('pointerdown', (e) => {
     isDragging = true;
+    pausePolling(4000);
     handlePointer(e);
   });
 
   window.addEventListener('pointermove', (e) => {
-    if (isDragging) handlePointer(e);
+    if (isDragging) {
+      pausePolling(4000);
+      handlePointer(e);
+    }
   });
 
   window.addEventListener('pointerup', () => {
@@ -1831,25 +1864,29 @@ function updateSubcontrolToggles(zone) {
 
 async function toggleZoneAuto() {
   if (!activeZoneDetail) return;
+  pausePolling(4000);
   const newAuto = !(activeZoneDetail.mode === 'AUTO');
   activeZoneDetail.mode = newAuto ? 'AUTO' : 'MANUAL';
   updateSubcontrolToggles(activeZoneDetail);
   renderHeroBanners();
   renderBentoZones();
 
-  try {
-    await fetch('/api/zone', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ zoneId: activeZoneDetail.id, auto: newAuto })
-    });
+  fetch('/api/zone', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ zoneId: activeZoneDetail.id, auto: newAuto })
+  }).then(res => {
+    if (!res.ok) throw new Error('Action failed');
     showToast(`${activeZoneDetail.name} mode: ${activeZoneDetail.mode}`);
-    fetchStatus();
-  } catch (e) {}
+  }).catch(e => {
+    showToast('Action failed', true);
+    fetchStatus(true);
+  });
 }
 
 async function toggleZoneEco() {
   if (!activeZoneDetail) return;
+  pausePolling(4000);
   const ecoPwm = LightingEngine.percentToPwm(50);
   activeZoneDetail.pwm = ecoPwm;
   activeZoneDetail.mode = 'MANUAL';
@@ -1858,15 +1895,17 @@ async function toggleZoneEco() {
   renderHeroBanners();
   renderBentoZones();
 
-  try {
-    await fetch('/api/zone', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ zoneId: activeZoneDetail.id, pwm: ecoPwm })
-    });
+  fetch('/api/zone', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ zoneId: activeZoneDetail.id, pwm: ecoPwm })
+  }).then(res => {
+    if (!res.ok) throw new Error('Action failed');
     showToast(`${activeZoneDetail.name} preset: 50%`);
-    fetchStatus();
-  } catch (e) {}
+  }).catch(e => {
+    showToast('Action failed', true);
+    fetchStatus(true);
+  });
 }
 
 async function strobeCurrentZone() {
@@ -1883,46 +1922,67 @@ async function strobeCurrentZone() {
 
 async function toggleZonePowerMaster() {
   if (!activeZoneDetail) return;
+  pausePolling(4000);
   const isCurrentlyOn = (activeZoneDetail.power !== false && activeZoneDetail.pwm > 0);
   const newPwm = isCurrentlyOn ? 0 : 1023;
   activeZoneDetail.pwm = newPwm;
   activeZoneDetail.power = !isCurrentlyOn;
   activeZoneDetail.mode = 'MANUAL';
+
+  // Instant 0ms optimistic update across zones and fixtures
+  if (farmState.slaves) {
+    farmState.slaves.forEach(s => {
+      if (s.zoneId === activeZoneDetail.id) {
+        s.on = !isCurrentlyOn;
+        s.pwm = newPwm;
+      }
+    });
+  }
+
   updateRadialGaugeUI(isCurrentlyOn ? 0 : 100);
   updateSubcontrolToggles(activeZoneDetail);
   renderHeroBanners();
   renderBentoZones();
+  renderFleetViews();
 
-  try {
-    await fetch('/api/zone', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ zoneId: activeZoneDetail.id, on: !isCurrentlyOn, pwm: newPwm })
-    });
+  fetch('/api/zone', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ zoneId: activeZoneDetail.id, on: !isCurrentlyOn, pwm: newPwm })
+  }).then(res => {
+    if (!res.ok) throw new Error('Action failed');
     showToast(`${activeZoneDetail.name} turned ${!isCurrentlyOn ? 'ON' : 'OFF'}`);
-    fetchStatus();
-  } catch (e) {}
+  }).catch(e => {
+    showToast('Action failed', true);
+    fetchStatus(true);
+  });
 }
 
 async function toggleDevicePower(nodeId) {
   const slave = farmState.slaves.find(s => s.nodeId === nodeId);
   if (!slave) return;
+  pausePolling(4000);
   const isCurrentlyOn = (slave.pwm > 0);
   const newPwm = isCurrentlyOn ? 0 : 1023;
   slave.pwm = newPwm;
+  slave.on = !isCurrentlyOn;
   renderFleetViews();
 
-  try {
-    await fetch('/api/fixture/toggle', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ nodeId: nodeId, on: !isCurrentlyOn })
-    });
+  fetch('/api/fixture/toggle', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ nodeId: nodeId, on: !isCurrentlyOn })
+  }).then(res => {
+    if (!res.ok) throw new Error('Action failed');
     showToast(`${slave.name} turned ${!isCurrentlyOn ? 'ON' : 'OFF'}`);
-  } catch (e) {}
+  }).catch(e => {
+    showToast('Action failed', true);
+    fetchStatus(true);
+  });
 }
 
 async function setGlobalAll(on) {
+  pausePolling(4000);
   if (farmState.zones) {
     farmState.zones.forEach(z => {
       z.mode = 'MANUAL';
@@ -1936,20 +1996,30 @@ async function setGlobalAll(on) {
       updateRadialGaugeUI(on ? 100 : 0);
       updateSubcontrolToggles(activeZoneDetail);
     }
-    renderAll();
   }
-  try {
-    await fetch('/api/all', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ on: on })
+  if (farmState.slaves) {
+    farmState.slaves.forEach(s => {
+      s.on = on;
+      s.pwm = on ? 1023 : 0;
     });
+  }
+  renderAll();
+
+  fetch('/api/all', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ on: on })
+  }).then(res => {
+    if (!res.ok) throw new Error('Action failed');
     showToast(`All fixtures turned ${on ? 'ON (100%)' : 'OFF (0%)'}`);
-    fetchStatus();
-  } catch (e) {}
+  }).catch(e => {
+    showToast('Action failed', true);
+    fetchStatus(true);
+  });
 }
 
 async function restoreGlobalAuto() {
+  pausePolling(4000);
   if (farmState.zones) {
     farmState.zones.forEach(z => { z.mode = 'AUTO'; });
     if (activeZoneDetail) {
@@ -1958,15 +2028,18 @@ async function restoreGlobalAuto() {
     }
     renderAll();
   }
-  try {
-    await fetch('/api/auto-all', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ auto: true })
-    });
+
+  fetch('/api/auto-all', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ auto: true })
+  }).then(res => {
+    if (!res.ok) throw new Error('Action failed');
     showToast("Restored Photoperiod AUTO mode across all zones");
-    fetchStatus();
-  } catch (e) {}
+  }).catch(e => {
+    showToast('Action failed', true);
+    fetchStatus(true);
+  });
 }
 
 async function saveScheduleForm() {
@@ -3072,11 +3145,11 @@ window.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  // Connect to Remote by default on open; switch to Local if configured
+  // Connect to Local by default on open; switch to Remote if configured
   if (farmState.connectionMode === 'remote') {
     startCloudMqtt();
   } else {
-    fetchStatus();
-    pollTimer = setInterval(fetchStatus, 2500);
+    fetchStatus(true);
+    pollTimer = setInterval(fetchStatus, 3500);
   }
 });
