@@ -2524,7 +2524,15 @@ p, span, div, label, input, select, button {
   color: var(--text-muted);
 }
 
-
+.app-branding-footer {
+  text-align: center;
+  padding: 22px 10px 18px 10px;
+  font-size: 0.74rem;
+  font-weight: 500;
+  color: var(--text-light);
+  letter-spacing: 0.3px;
+  user-select: none;
+}
 
 </style>
 
@@ -3193,6 +3201,26 @@ p, span, div, label, input, select, button {
               <circle cx="12" cy="12" r="1.8" fill="currentColor" stroke="none"></circle>
             </svg>
           </button>
+        </div>
+
+        <!-- Live Router IP & Local Access Box (Visible when Master is on Farm Wi-Fi) -->
+        <div id="staNetworkInfoBox" style="display: none; margin: 12px 0 14px 0; padding: 12px 14px; background: var(--bg-card-subtle); border-radius: 12px; border: 1px solid var(--border-subtle); font-size: 0.8rem;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+            <span style="color: var(--text-muted);">Farm Router IP:</span>
+            <span id="staIpValue" style="font-family: var(--font-mono); font-weight: 700; color: var(--primary-purple);">--</span>
+          </div>
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+            <span style="color: var(--text-muted);">Local mDNS URL:</span>
+            <span style="font-family: var(--font-mono); font-weight: 600; color: var(--text-main);">http://samposhi.local</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr auto; gap: 8px;">
+            <button type="button" class="btn-purple-primary" style="padding: 7px 10px; font-size: 0.74rem; font-weight: 500; justify-content: center; height: auto;" onclick="applyStaIpAsGateway()">
+              Switch Gateway to Router IP
+            </button>
+            <a id="staDirectLink" href="#" target="_blank" class="device-card-white" style="text-decoration: none; padding: 7px 12px; font-size: 0.74rem; font-weight: 600; display: flex; align-items: center; justify-content: center; height: auto;">
+              Open in Browser
+            </a>
+          </div>
         </div>
 
         <button class="btn-purple-primary" onclick="saveFarmWifiConfig()">
@@ -3878,7 +3906,18 @@ p, span, div, label, input, select, button {
       <div id="localParamsSection" style="display: none; margin-bottom: 14px;">
         <label style="font-size: 0.78rem; font-weight: 500; color: var(--text-muted); display: block; margin-bottom: 6px;">Gateway Local IP Address</label>
         <div style="margin-bottom: 8px;">
-          <input type="text" id="modalLocalGatewayIp" class="styled-input" placeholder="192.168.4.1" style="font-family: var(--font-mono); font-size: 0.85rem; margin-bottom: 0;">
+          <input type="text" id="modalLocalGatewayIp" class="styled-input" placeholder="192.168.4.1" style="font-family: var(--font-mono); font-size: 0.85rem; margin-bottom: 6px;">
+          <div style="display: flex; gap: 6px; flex-wrap: wrap;">
+            <button type="button" class="segmented-toggle-btn active" style="padding: 4px 8px; font-size: 0.72rem; border-radius: 6px;" onclick="setModalLocalIpPreset('192.168.4.1')">
+              192.168.4.1 (Hotspot)
+            </button>
+            <button type="button" class="segmented-toggle-btn" style="padding: 4px 8px; font-size: 0.72rem; border-radius: 6px;" onclick="setModalLocalIpPreset('samposhi.local')">
+              samposhi.local (mDNS)
+            </button>
+            <button type="button" id="btnPresetStaIp" class="segmented-toggle-btn" style="display: none; padding: 4px 8px; font-size: 0.72rem; border-radius: 6px;" onclick="setModalLocalIpPreset('')">
+              Farm Wi-Fi
+            </button>
+          </div>
         </div>
         <p style="font-size: 0.76rem; color: var(--text-muted); line-height: 1.4; margin: 0;">
           Default is <code>192.168.4.1</code> when connected to ESP32 hotspot (<b>SamposhiFarm</b>). If connected via your farm router Wi-Fi, enter the assigned station IP.
@@ -4174,6 +4213,11 @@ let farmState = {
   connectionMode: (function() {
     const saved = localStorage.getItem('samposhi_conn_mode');
     if (saved) return saved;
+    if (typeof window !== 'undefined' && window.location) {
+      if (window.location.protocol === 'https:' || (window.location.hostname && window.location.hostname.includes('.github.io'))) {
+        return 'remote';
+      }
+    }
     return 'local';
   })(),
   mqttConnected: false,
@@ -4438,60 +4482,146 @@ function stopCloudMqtt() {
   renderSettingsTab();
 }
 
-function getTargetGatewayHost() {
-  let saved = (localStorage.getItem('samposhi_local_ip') || '').trim();
+let activeWorkingGatewayHost = null;
+let isProbingGateways = false;
+
+function getCandidateGatewayHosts() {
+  const list = [];
+  // 1. Current origin hostname if running directly on device web server
+  if (typeof window !== 'undefined' && window.location && window.location.hostname) {
+    const hn = window.location.hostname;
+    if (hn && hn !== 'localhost' && hn !== '127.0.0.1' && !hn.includes('.github.io') && !hn.includes('netlify.app') && !hn.includes('vercel.app')) {
+      list.push(hn);
+    }
+  }
+  // 2. Active working host confirmed in this session
+  if (activeWorkingGatewayHost && !list.includes(activeWorkingGatewayHost)) {
+    list.push(activeWorkingGatewayHost);
+  }
+  // 3. User configured Local Gateway IP in modal (if set)
+  const saved = (localStorage.getItem('samposhi_local_ip') || '').trim();
   if (saved) {
-    if (saved.startsWith('http://')) saved = saved.slice(7);
-    if (saved.startsWith('https://')) saved = saved.slice(8);
-    if (saved.endsWith('/')) saved = saved.slice(0, -1);
-    return saved;
+    let clean = saved.replace(/^https?:\/\//, '').replace(/\/$/, '');
+    if (clean && !list.includes(clean)) list.push(clean);
   }
-  if (typeof farmState !== 'undefined' && farmState.staConnected && farmState.staIP && farmState.staIP !== '0.0.0.0') {
-    return farmState.staIP;
+  // 4. Farm Wi-Fi Router IP (Station IP from ESP32)
+  const staIp = (localStorage.getItem('samposhi_sta_ip') || (typeof farmState !== 'undefined' && farmState.staIP) || '').trim();
+  if (staIp && staIp !== '0.0.0.0' && !list.includes(staIp)) {
+    list.push(staIp);
   }
-  return '192.168.4.1';
+  // 5. mDNS hostname on Farm Wi-Fi
+  if (!list.includes('samposhi.local')) {
+    list.push('samposhi.local');
+  }
+  // 6. Default Master Hotspot AP IP
+  if (!list.includes('192.168.4.1')) {
+    list.push('192.168.4.1');
+  }
+  return list;
+}
+
+function getTargetGatewayHost() {
+  if (activeWorkingGatewayHost) return activeWorkingGatewayHost;
+  const candidates = getCandidateGatewayHosts();
+  return candidates[0] || '192.168.4.1';
 }
 
 const _nativeFetch = window.fetch;
+
+async function autoProbeCandidateGateways() {
+  if (isProbingGateways) return;
+  isProbingGateways = true;
+  try {
+    const candidates = getCandidateGatewayHosts();
+    const current = getTargetGatewayHost();
+    const toProbe = candidates.filter(c => c !== current);
+
+    for (const host of toProbe) {
+      try {
+        const ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        const tid = ctrl ? setTimeout(() => ctrl.abort(), 1800) : null;
+        const url = `http://${host}/api/status?_probe=${Date.now()}`;
+        const res = await _nativeFetch(url, { cache: 'no-store', signal: ctrl ? ctrl.signal : undefined });
+        if (tid) clearTimeout(tid);
+        if (res.ok) {
+          const data = await res.json();
+          activeWorkingGatewayHost = host;
+          localStorage.setItem('samposhi_local_ip', host);
+          farmState.masterOnline = true;
+          applyGatewayData(data);
+          renderAll();
+          logRemoteTerminal(`Auto-connected to Master at http://${host}`, 'ok');
+          if (typeof showToast === 'function') {
+            showToast(`Connected to Master at ${host}`);
+          }
+          break;
+        }
+      } catch (e) {}
+    }
+  } finally {
+    isProbingGateways = false;
+  }
+}
+
 window.fetch = async function(url, options) {
   const activeMode = (typeof farmState !== 'undefined' && farmState.connectionMode) || localStorage.getItem('samposhi_conn_mode') || 'local';
-  if (activeMode === 'local') {
-    let reqUrl = url;
-    if (typeof url === 'string' && (url.startsWith('/') || url.startsWith('api/'))) {
-      const path = url.startsWith('/') ? url : `/${url}`;
-      const targetHost = getTargetGatewayHost();
-      if (typeof window !== 'undefined' && window.location && window.location.hostname !== targetHost) {
-        reqUrl = `http://${targetHost}${path}`;
-      }
+
+  let reqUrl = url;
+  let isApiCall = false;
+  if (typeof url === 'string' && (url.startsWith('/') || url.startsWith('api/'))) {
+    isApiCall = true;
+    const path = url.startsWith('/') ? url : `/${url}`;
+    const targetHost = getTargetGatewayHost();
+    if (typeof window !== 'undefined' && window.location && window.location.hostname === targetHost) {
+      reqUrl = path;
+    } else {
+      reqUrl = `http://${targetHost}${path}`;
     }
-    return _nativeFetch(reqUrl, options);
   }
 
-  // Cloud Remote MQTT Interception
-  if (typeof url === 'string') {
-    if (url.includes('/api/status')) {
-      return new Response(JSON.stringify(farmState || {}), { status: 200, headers: { 'Content-Type': 'application/json' } });
-    }
+  // A. LOCAL MODE: Direct cleartext HTTP to Gateway
+  if (activeMode === 'local') {
+    const p = _nativeFetch(reqUrl, options);
+    p.then(r => {
+      if (r && r.ok && isApiCall) {
+        activeWorkingGatewayHost = getTargetGatewayHost();
+      }
+    }).catch(() => {});
+    return p;
+  }
 
+  // B. REMOTE CLOUD MODE: Cloud MQTT Interception + Concurrent Local Fast Dispatch
+  if (typeof url === 'string' && isApiCall) {
     let body = {};
     if (options && options.body) {
       try { body = JSON.parse(options.body); } catch (e) {}
     }
 
-    // Fast local opportunistic dispatch:
-    // If phone is in range of Master Hotspot or farm Wi-Fi, fire direct local HTTP concurrently.
-    // Master executes CMD_INSTANT locally in <10ms, while Cloud MQTT synchronizes remote brokers.
-    if (!url.includes('/api/status')) {
+    // Status request in Remote mode:
+    if (url.includes('/api/status')) {
       try {
-        const targetHost = getTargetGatewayHost();
-        const path = url.startsWith('/') ? url : `/${url}`;
-        const localTarget = `http://${targetHost}${path}`;
+        const localHost = getTargetGatewayHost();
+        const localUrl = `http://${localHost}/api/status?_t=${Date.now()}`;
         const ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
-        if (ctrl) setTimeout(() => ctrl.abort(), 1200);
-        _nativeFetch(localTarget, Object.assign({}, options, { signal: ctrl ? ctrl.signal : undefined })).catch(() => {});
+        const tid = ctrl ? setTimeout(() => ctrl.abort(), 1200) : null;
+        const lRes = await _nativeFetch(localUrl, { cache: 'no-store', signal: ctrl ? ctrl.signal : undefined });
+        if (tid) clearTimeout(tid);
+        if (lRes.ok) return lRes;
       } catch (e) {}
+      return new Response(JSON.stringify(farmState || {}), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
 
+    // Fast local opportunistic dispatch for control commands (concurrent <15ms trigger)
+    try {
+      const localHost = getTargetGatewayHost();
+      const path = url.startsWith('/') ? url : `/${url}`;
+      const localTarget = `http://${localHost}${path}`;
+      const ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+      if (ctrl) setTimeout(() => ctrl.abort(), 1500);
+      _nativeFetch(localTarget, Object.assign({}, options, { signal: ctrl ? ctrl.signal : undefined })).catch(() => {});
+    } catch (e) {}
+
+    // Cloud MQTT command topic
     if (url.includes('/api/all')) {
       sendCloudMqttCommand({ cmd: "all", on: body.on });
     } else if (url.includes('/api/auto-all')) {
@@ -4505,10 +4635,9 @@ window.fetch = async function(url, options) {
         if (body.auto) {
           sendCloudMqttCommand({ cmd: "zone_auto", zoneId: body.zoneId });
         } else {
-          sendCloudMqttCommand({ cmd: "zone_pwm", zoneId: body.zoneId, pwm: body.pwm !== undefined ? body.pwm : (activeZoneDetail ? activeZoneDetail.pwm : 0) });
+          sendCloudMqttCommand({ cmd: "zone_pwm", zoneId: body.zoneId, pwm: body.pwm !== undefined ? body.pwm : 0 });
         }
       } else if (body.on !== undefined && (body.pwm === undefined || body.pwm === 0 || body.pwm === 1023)) {
-        // Direct instant power switch on Master (CMD_INSTANT)
         sendCloudMqttCommand({ cmd: "zone_power", zoneId: body.zoneId, on: body.on });
       } else if (body.pwm !== undefined) {
         sendCloudMqttCommand({ cmd: "zone_pwm", zoneId: body.zoneId, pwm: body.pwm });
@@ -4556,7 +4685,7 @@ window.fetch = async function(url, options) {
 function applyGatewayData(data) {
   if (!data) return;
   const themes = ["rose", "cyan", "yellow", "green"];
-  if (Array.isArray(data.zones)) {
+  if (Array.isArray(data.zones) && data.zones.length > 0) {
     data.zones.forEach((z, idx) => {
       const existing = farmState.zones ? farmState.zones.find(ez => ez.id === z.id) : null;
       if (!z.theme) z.theme = (existing && existing.theme) ? existing.theme : themes[idx % themes.length];
@@ -4570,8 +4699,18 @@ function applyGatewayData(data) {
       const updatedActive = data.zones.find(z => z.id === activeZoneDetail.id);
       if (updatedActive) activeZoneDetail = updatedActive;
     }
+    farmState.zones = data.zones;
   }
-  farmState = Object.assign({}, farmState, data);
+  if (Array.isArray(data.slaves) && data.slaves.length > 0) {
+    farmState.slaves = data.slaves;
+  }
+  const copy = Object.assign({}, data);
+  delete copy.zones;
+  delete copy.slaves;
+  farmState = Object.assign({}, farmState, copy);
+  if (data.staConnected && data.staIP && data.staIP !== '0.0.0.0') {
+    localStorage.setItem('samposhi_sta_ip', data.staIP);
+  }
   parseMasterTime(data);
 }
 
@@ -4636,7 +4775,7 @@ function getAmbientLightLevelPct() {
 async function fetchStatus(force = false) {
   if (!force && pausePollingTimer) return;
   const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
-  const timeoutId = controller ? setTimeout(() => controller.abort(), 2500) : null;
+  const timeoutId = controller ? setTimeout(() => controller.abort(), 4000) : null;
   try {
     const fetchOpts = { cache: 'no-store' };
     if (controller) fetchOpts.signal = controller.signal;
@@ -4648,13 +4787,21 @@ async function fetchStatus(force = false) {
       applyGatewayData(data);
       renderAll();
     } else {
-      farmState.masterOnline = false;
-      renderHeader();
+      if (force || !farmState.zones || farmState.zones.length === 0) {
+        farmState.masterOnline = false;
+        renderHeader();
+      }
+      const activeMode = (typeof farmState !== 'undefined' && farmState.connectionMode) || localStorage.getItem('samposhi_conn_mode') || 'local';
+      if (activeMode === 'local') autoProbeCandidateGateways();
     }
   } catch (e) {
     if (timeoutId) clearTimeout(timeoutId);
-    farmState.masterOnline = false;
-    renderHeader();
+    if (force || !farmState.zones || farmState.zones.length === 0) {
+      farmState.masterOnline = false;
+      renderHeader();
+    }
+    const activeMode = (typeof farmState !== 'undefined' && farmState.connectionMode) || localStorage.getItem('samposhi_conn_mode') || 'local';
+    if (activeMode === 'local') autoProbeCandidateGateways();
   }
 }
 
@@ -5064,7 +5211,7 @@ function renderSettingsTab() {
     rSsid.value = farmState.routerSSID;
   }
 
-  // Section 3: Farm WiFi Live Status Indicator
+  // Section 3: Farm WiFi Live Status Indicator & IP details
   const staBadge = document.getElementById('staStatusBadge');
   const staTxt = document.getElementById('staStatusTxt');
   if (staBadge && staTxt) {
@@ -5077,6 +5224,20 @@ function renderSettingsTab() {
     } else {
       staBadge.className = "status-pill offline";
       staTxt.textContent = "Disconnected";
+    }
+  }
+
+  const staInfoBox = document.getElementById('staNetworkInfoBox');
+  const staIpVal = document.getElementById('staIpValue');
+  const staLink = document.getElementById('staDirectLink');
+  if (staInfoBox && staIpVal) {
+    if (farmState.staConnected && farmState.staIP && farmState.staIP !== '0.0.0.0') {
+      staInfoBox.style.display = 'block';
+      staIpVal.textContent = farmState.staIP;
+      if (staLink) staLink.href = `http://${farmState.staIP}`;
+      localStorage.setItem('samposhi_sta_ip', farmState.staIP);
+    } else {
+      staInfoBox.style.display = 'none';
     }
   }
 
@@ -5502,7 +5663,18 @@ function openRemoteConnectionModal() {
   if (userEl) userEl.value = farmState.mqttUser || localStorage.getItem('samposhi_mqtt_user') || "";
   if (passEl) passEl.value = localStorage.getItem('samposhi_mqtt_pass') || "";
   if (enEl) enEl.checked = farmState.mqttEnabled !== false;
-  if (localIpEl) localIpEl.value = localStorage.getItem('samposhi_local_ip') || '192.168.4.1';
+  if (localIpEl) localIpEl.value = getTargetGatewayHost();
+  const staPresetBtn = document.getElementById('btnPresetStaIp');
+  if (staPresetBtn) {
+    const staIp = (farmState.staIP || localStorage.getItem('samposhi_sta_ip') || '').trim();
+    if (staIp && staIp !== '0.0.0.0') {
+      staPresetBtn.style.display = 'inline-block';
+      staPresetBtn.textContent = `Farm Wi-Fi (${staIp})`;
+      staPresetBtn.onclick = () => setModalLocalIpPreset(staIp);
+    } else {
+      staPresetBtn.style.display = 'none';
+    }
+  }
 
   // Sync mode pills and sections
   const mode = farmState.connectionMode || 'remote';
@@ -5514,7 +5686,7 @@ function openRemoteConnectionModal() {
   const terminal = document.getElementById('remoteTerminalLogs');
   if (terminal && terminal.children.length === 0) {
     logRemoteTerminal("Terminal initialized.", "sys");
-    const savedIp = localStorage.getItem('samposhi_local_ip') || '192.168.4.1';
+    const savedIp = getTargetGatewayHost();
     logRemoteTerminal(`Local Gateway: http://${savedIp}`, "ok");
     logRemoteTerminal(`Target Broker: ${farmState.mqttBroker || 'broker.emqx.io'}:${farmState.mqttPort || 1883}`, "net");
     logRemoteTerminal(`Resolved WS URL: ${getMqttWsUrl()}`, "net");
@@ -5527,6 +5699,31 @@ function openRemoteConnectionModal() {
     } else {
       logRemoteTerminal(`Status: ${farmState.connectionMode === 'remote' ? 'CONNECTING...' : 'DISCONNECTED'}`, "warn");
     }
+  }
+}
+
+function setModalLocalIpPreset(ip) {
+  let targetIp = ip;
+  if (!targetIp) {
+    targetIp = (farmState.staIP || localStorage.getItem('samposhi_sta_ip') || '').trim();
+  }
+  const ipInput = document.getElementById('modalLocalGatewayIp');
+  if (ipInput && targetIp) {
+    ipInput.value = targetIp;
+    ipInput.focus();
+  }
+}
+
+function applyStaIpAsGateway() {
+  const staIp = (farmState.staIP || localStorage.getItem('samposhi_sta_ip') || '').trim();
+  if (staIp && staIp !== '0.0.0.0') {
+    activeWorkingGatewayHost = staIp;
+    localStorage.setItem('samposhi_local_ip', staIp);
+    const ipInput = document.getElementById('modalLocalGatewayIp');
+    if (ipInput) ipInput.value = staIp;
+    if (typeof showToast === 'function') showToast(`Gateway switched to Farm Router IP: ${staIp}`);
+    fetchStatus(true);
+    renderSettingsTab();
   }
 }
 
@@ -5584,8 +5781,10 @@ async function saveAndConnectRemoteModal() {
   if (farmState.connectionMode === 'local') {
     const ipInput = document.getElementById('modalLocalGatewayIp');
     if (ipInput) {
-      const val = ipInput.value.trim() || '192.168.4.1';
+      let val = (ipInput.value || '').trim() || '192.168.4.1';
+      val = val.replace(/^https?:\/\//, '').replace(/\/$/, '');
       localStorage.setItem('samposhi_local_ip', val);
+      activeWorkingGatewayHost = val;
       logRemoteTerminal(`Gateway IP configured to: http://${val}`, "ok");
       showToast(`Gateway IP set to ${val}`);
     }
@@ -5938,11 +6137,9 @@ async function onRadialSliderChange(pctVal) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ zoneId: activeZoneDetail.id, pwm: pwm })
   }).then(res => {
-    if (!res.ok) throw new Error('Action failed');
-    showToast(`${activeZoneDetail.name} set to ${pct}% (${pwm} PWM)`);
+    if (res.ok) showToast(`${activeZoneDetail.name} set to ${pct}% (${pwm} PWM)`);
   }).catch(e => {
-    showToast('Action failed', true);
-    fetchStatus(true);
+    console.warn('Zone slider notice:', e);
   });
 }
 
@@ -6020,7 +6217,7 @@ function updateSubcontrolToggles(zone) {
 
 async function toggleZoneAuto() {
   if (!activeZoneDetail) return;
-  pausePolling(4000);
+  pausePolling(3000);
   const newAuto = !(activeZoneDetail.mode === 'AUTO');
   activeZoneDetail.mode = newAuto ? 'AUTO' : 'MANUAL';
   updateSubcontrolToggles(activeZoneDetail);
@@ -6032,17 +6229,15 @@ async function toggleZoneAuto() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ zoneId: activeZoneDetail.id, auto: newAuto })
   }).then(res => {
-    if (!res.ok) throw new Error('Action failed');
-    showToast(`${activeZoneDetail.name} mode: ${activeZoneDetail.mode}`);
+    if (res.ok) showToast(`${activeZoneDetail.name} mode: ${activeZoneDetail.mode}`);
   }).catch(e => {
-    showToast('Action failed', true);
-    fetchStatus(true);
+    console.warn('Zone auto notice:', e);
   });
 }
 
 async function toggleZoneEco() {
   if (!activeZoneDetail) return;
-  pausePolling(4000);
+  pausePolling(3000);
   const ecoPwm = LightingEngine.percentToPwm(50);
   activeZoneDetail.pwm = ecoPwm;
   activeZoneDetail.mode = 'MANUAL';
@@ -6056,11 +6251,9 @@ async function toggleZoneEco() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ zoneId: activeZoneDetail.id, pwm: ecoPwm })
   }).then(res => {
-    if (!res.ok) throw new Error('Action failed');
-    showToast(`${activeZoneDetail.name} preset: 50%`);
+    if (res.ok) showToast(`${activeZoneDetail.name} preset: 50%`);
   }).catch(e => {
-    showToast('Action failed', true);
-    fetchStatus(true);
+    console.warn('Zone eco notice:', e);
   });
 }
 
@@ -6078,7 +6271,7 @@ async function strobeCurrentZone() {
 
 async function toggleZonePowerMaster() {
   if (!activeZoneDetail) return;
-  pausePolling(4000);
+  pausePolling(3000);
   const isCurrentlyOn = (activeZoneDetail.power !== false && activeZoneDetail.pwm > 0);
   const newPwm = isCurrentlyOn ? 0 : 1023;
   activeZoneDetail.pwm = newPwm;
@@ -6106,18 +6299,16 @@ async function toggleZonePowerMaster() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ zoneId: activeZoneDetail.id, on: !isCurrentlyOn, pwm: newPwm })
   }).then(res => {
-    if (!res.ok) throw new Error('Action failed');
-    showToast(`${activeZoneDetail.name} turned ${!isCurrentlyOn ? 'ON' : 'OFF'}`);
+    if (res.ok) showToast(`${activeZoneDetail.name} turned ${!isCurrentlyOn ? 'ON' : 'OFF'}`);
   }).catch(e => {
-    showToast('Action failed', true);
-    fetchStatus(true);
+    console.warn('Zone power notice:', e);
   });
 }
 
 async function toggleDevicePower(nodeId) {
   const slave = farmState.slaves.find(s => s.nodeId === nodeId);
   if (!slave) return;
-  pausePolling(4000);
+  pausePolling(3000);
   const isCurrentlyOn = (slave.pwm > 0);
   const newPwm = isCurrentlyOn ? 0 : 1023;
   slave.pwm = newPwm;
@@ -6129,16 +6320,14 @@ async function toggleDevicePower(nodeId) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ nodeId: nodeId, on: !isCurrentlyOn })
   }).then(res => {
-    if (!res.ok) throw new Error('Action failed');
-    showToast(`${slave.name} turned ${!isCurrentlyOn ? 'ON' : 'OFF'}`);
+    if (res.ok) showToast(`${slave.name} turned ${!isCurrentlyOn ? 'ON' : 'OFF'}`);
   }).catch(e => {
-    showToast('Action failed', true);
-    fetchStatus(true);
+    console.warn('Fixture power notice:', e);
   });
 }
 
 async function setGlobalAll(on) {
-  pausePolling(4000);
+  pausePolling(3000);
   if (farmState.zones) {
     farmState.zones.forEach(z => {
       z.mode = 'MANUAL';
@@ -6166,16 +6355,14 @@ async function setGlobalAll(on) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ on: on })
   }).then(res => {
-    if (!res.ok) throw new Error('Action failed');
-    showToast(`All fixtures turned ${on ? 'ON (100%)' : 'OFF (0%)'}`);
+    if (res.ok) showToast(`All fixtures turned ${on ? 'ON (100%)' : 'OFF (0%)'}`);
   }).catch(e => {
-    showToast('Action failed', true);
-    fetchStatus(true);
+    console.warn('Global all notice:', e);
   });
 }
 
 async function restoreGlobalAuto() {
-  pausePolling(4000);
+  pausePolling(3000);
   if (farmState.zones) {
     farmState.zones.forEach(z => { z.mode = 'AUTO'; });
     if (activeZoneDetail) {
@@ -6190,11 +6377,9 @@ async function restoreGlobalAuto() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ auto: true })
   }).then(res => {
-    if (!res.ok) throw new Error('Action failed');
-    showToast("Restored Photoperiod AUTO mode across all zones");
+    if (res.ok) showToast("Restored Photoperiod AUTO mode across all zones");
   }).catch(e => {
-    showToast('Action failed', true);
-    fetchStatus(true);
+    console.warn('Restore auto notice:', e);
   });
 }
 
@@ -7301,12 +7486,14 @@ window.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  // Connect to Local by default on open; switch to Remote if configured
+  // Initialize active transport on open
   if (farmState.connectionMode === 'remote') {
     startCloudMqtt();
+    fetchStatus(true);
+    if (!pollTimer) pollTimer = setInterval(fetchStatus, 4000);
   } else {
     fetchStatus(true);
-    pollTimer = setInterval(fetchStatus, 3500);
+    if (!pollTimer) pollTimer = setInterval(fetchStatus, 3500);
   }
 });
 

@@ -690,6 +690,26 @@
           </button>
         </div>
 
+        <!-- Live Router IP & Local Access Box (Visible when Master is on Farm Wi-Fi) -->
+        <div id="staNetworkInfoBox" style="display: none; margin: 12px 0 14px 0; padding: 12px 14px; background: var(--bg-card-subtle); border-radius: 12px; border: 1px solid var(--border-subtle); font-size: 0.8rem;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+            <span style="color: var(--text-muted);">Farm Router IP:</span>
+            <span id="staIpValue" style="font-family: var(--font-mono); font-weight: 700; color: var(--primary-purple);">--</span>
+          </div>
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+            <span style="color: var(--text-muted);">Local mDNS URL:</span>
+            <span style="font-family: var(--font-mono); font-weight: 600; color: var(--text-main);">http://samposhi.local</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr auto; gap: 8px;">
+            <button type="button" class="btn-purple-primary" style="padding: 7px 10px; font-size: 0.74rem; font-weight: 500; justify-content: center; height: auto;" onclick="applyStaIpAsGateway()">
+              Switch Gateway to Router IP
+            </button>
+            <a id="staDirectLink" href="#" target="_blank" class="device-card-white" style="text-decoration: none; padding: 7px 12px; font-size: 0.74rem; font-weight: 600; display: flex; align-items: center; justify-content: center; height: auto;">
+              Open in Browser
+            </a>
+          </div>
+        </div>
+
         <button class="btn-purple-primary" onclick="saveFarmWifiConfig()">
           Save Internet WiFi
         </button>
@@ -1373,7 +1393,18 @@
       <div id="localParamsSection" style="display: none; margin-bottom: 14px;">
         <label style="font-size: 0.78rem; font-weight: 500; color: var(--text-muted); display: block; margin-bottom: 6px;">Gateway Local IP Address</label>
         <div style="margin-bottom: 8px;">
-          <input type="text" id="modalLocalGatewayIp" class="styled-input" placeholder="192.168.4.1" style="font-family: var(--font-mono); font-size: 0.85rem; margin-bottom: 0;">
+          <input type="text" id="modalLocalGatewayIp" class="styled-input" placeholder="192.168.4.1" style="font-family: var(--font-mono); font-size: 0.85rem; margin-bottom: 6px;">
+          <div style="display: flex; gap: 6px; flex-wrap: wrap;">
+            <button type="button" class="segmented-toggle-btn active" style="padding: 4px 8px; font-size: 0.72rem; border-radius: 6px;" onclick="setModalLocalIpPreset('192.168.4.1')">
+              192.168.4.1 (Hotspot)
+            </button>
+            <button type="button" class="segmented-toggle-btn" style="padding: 4px 8px; font-size: 0.72rem; border-radius: 6px;" onclick="setModalLocalIpPreset('samposhi.local')">
+              samposhi.local (mDNS)
+            </button>
+            <button type="button" id="btnPresetStaIp" class="segmented-toggle-btn" style="display: none; padding: 4px 8px; font-size: 0.72rem; border-radius: 6px;" onclick="setModalLocalIpPreset('')">
+              Farm Wi-Fi
+            </button>
+          </div>
         </div>
         <p style="font-size: 0.76rem; color: var(--text-muted); line-height: 1.4; margin: 0;">
           Default is <code>192.168.4.1</code> when connected to ESP32 hotspot (<b>SamposhiFarm</b>). If connected via your farm router Wi-Fi, enter the assigned station IP.

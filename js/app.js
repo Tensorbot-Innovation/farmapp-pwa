@@ -287,27 +287,87 @@ function stopCloudMqtt() {
   renderSettingsTab();
 }
 
-function getTargetGatewayHost() {
-  let saved = (localStorage.getItem('samposhi_local_ip') || '').trim();
-  if (saved) {
-    if (saved.startsWith('http://')) saved = saved.slice(7);
-    if (saved.startsWith('https://')) saved = saved.slice(8);
-    if (saved.endsWith('/')) saved = saved.slice(0, -1);
-    return saved;
-  }
+let activeWorkingGatewayHost = null;
+let isProbingGateways = false;
+
+function getCandidateGatewayHosts() {
+  const list = [];
+  // 1. Current origin hostname if running directly on device web server
   if (typeof window !== 'undefined' && window.location && window.location.hostname) {
     const hn = window.location.hostname;
     if (hn && hn !== 'localhost' && hn !== '127.0.0.1' && !hn.includes('.github.io') && !hn.includes('netlify.app') && !hn.includes('vercel.app')) {
-      return hn;
+      list.push(hn);
     }
   }
-  if (typeof farmState !== 'undefined' && farmState.staConnected && farmState.staIP && farmState.staIP !== '0.0.0.0') {
-    return farmState.staIP;
+  // 2. Active working host confirmed in this session
+  if (activeWorkingGatewayHost && !list.includes(activeWorkingGatewayHost)) {
+    list.push(activeWorkingGatewayHost);
   }
-  return '192.168.4.1';
+  // 3. User configured Local Gateway IP in modal (if set)
+  const saved = (localStorage.getItem('samposhi_local_ip') || '').trim();
+  if (saved) {
+    let clean = saved.replace(/^https?:\/\//, '').replace(/\/$/, '');
+    if (clean && !list.includes(clean)) list.push(clean);
+  }
+  // 4. Farm Wi-Fi Router IP (Station IP from ESP32)
+  const staIp = (localStorage.getItem('samposhi_sta_ip') || (typeof farmState !== 'undefined' && farmState.staIP) || '').trim();
+  if (staIp && staIp !== '0.0.0.0' && !list.includes(staIp)) {
+    list.push(staIp);
+  }
+  // 5. mDNS hostname on Farm Wi-Fi
+  if (!list.includes('samposhi.local')) {
+    list.push('samposhi.local');
+  }
+  // 6. Default Master Hotspot AP IP
+  if (!list.includes('192.168.4.1')) {
+    list.push('192.168.4.1');
+  }
+  return list;
+}
+
+function getTargetGatewayHost() {
+  if (activeWorkingGatewayHost) return activeWorkingGatewayHost;
+  const candidates = getCandidateGatewayHosts();
+  return candidates[0] || '192.168.4.1';
 }
 
 const _nativeFetch = window.fetch;
+
+async function autoProbeCandidateGateways() {
+  if (isProbingGateways) return;
+  isProbingGateways = true;
+  try {
+    const candidates = getCandidateGatewayHosts();
+    const current = getTargetGatewayHost();
+    const toProbe = candidates.filter(c => c !== current);
+
+    for (const host of toProbe) {
+      try {
+        const ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        const tid = ctrl ? setTimeout(() => ctrl.abort(), 1800) : null;
+        const url = `http://${host}/api/status?_probe=${Date.now()}`;
+        const res = await _nativeFetch(url, { cache: 'no-store', signal: ctrl ? ctrl.signal : undefined });
+        if (tid) clearTimeout(tid);
+        if (res.ok) {
+          const data = await res.json();
+          activeWorkingGatewayHost = host;
+          localStorage.setItem('samposhi_local_ip', host);
+          farmState.masterOnline = true;
+          applyGatewayData(data);
+          renderAll();
+          logRemoteTerminal(`Auto-connected to Master at http://${host}`, 'ok');
+          if (typeof showToast === 'function') {
+            showToast(`Connected to Master at ${host}`);
+          }
+          break;
+        }
+      } catch (e) {}
+    }
+  } finally {
+    isProbingGateways = false;
+  }
+}
+
 window.fetch = async function(url, options) {
   const activeMode = (typeof farmState !== 'undefined' && farmState.connectionMode) || localStorage.getItem('samposhi_conn_mode') || 'local';
 
@@ -326,7 +386,13 @@ window.fetch = async function(url, options) {
 
   // A. LOCAL MODE: Direct cleartext HTTP to Gateway
   if (activeMode === 'local') {
-    return _nativeFetch(reqUrl, options);
+    const p = _nativeFetch(reqUrl, options);
+    p.then(r => {
+      if (r && r.ok && isApiCall) {
+        activeWorkingGatewayHost = getTargetGatewayHost();
+      }
+    }).catch(() => {});
+    return p;
   }
 
   // B. REMOTE CLOUD MODE: Cloud MQTT Interception + Concurrent Local Fast Dispatch
@@ -447,6 +513,9 @@ function applyGatewayData(data) {
   delete copy.zones;
   delete copy.slaves;
   farmState = Object.assign({}, farmState, copy);
+  if (data.staConnected && data.staIP && data.staIP !== '0.0.0.0') {
+    localStorage.setItem('samposhi_sta_ip', data.staIP);
+  }
   parseMasterTime(data);
 }
 
@@ -511,7 +580,7 @@ function getAmbientLightLevelPct() {
 async function fetchStatus(force = false) {
   if (!force && pausePollingTimer) return;
   const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
-  const timeoutId = controller ? setTimeout(() => controller.abort(), 5000) : null;
+  const timeoutId = controller ? setTimeout(() => controller.abort(), 4000) : null;
   try {
     const fetchOpts = { cache: 'no-store' };
     if (controller) fetchOpts.signal = controller.signal;
@@ -527,6 +596,8 @@ async function fetchStatus(force = false) {
         farmState.masterOnline = false;
         renderHeader();
       }
+      const activeMode = (typeof farmState !== 'undefined' && farmState.connectionMode) || localStorage.getItem('samposhi_conn_mode') || 'local';
+      if (activeMode === 'local') autoProbeCandidateGateways();
     }
   } catch (e) {
     if (timeoutId) clearTimeout(timeoutId);
@@ -534,6 +605,8 @@ async function fetchStatus(force = false) {
       farmState.masterOnline = false;
       renderHeader();
     }
+    const activeMode = (typeof farmState !== 'undefined' && farmState.connectionMode) || localStorage.getItem('samposhi_conn_mode') || 'local';
+    if (activeMode === 'local') autoProbeCandidateGateways();
   }
 }
 
@@ -943,7 +1016,7 @@ function renderSettingsTab() {
     rSsid.value = farmState.routerSSID;
   }
 
-  // Section 3: Farm WiFi Live Status Indicator
+  // Section 3: Farm WiFi Live Status Indicator & IP details
   const staBadge = document.getElementById('staStatusBadge');
   const staTxt = document.getElementById('staStatusTxt');
   if (staBadge && staTxt) {
@@ -956,6 +1029,20 @@ function renderSettingsTab() {
     } else {
       staBadge.className = "status-pill offline";
       staTxt.textContent = "Disconnected";
+    }
+  }
+
+  const staInfoBox = document.getElementById('staNetworkInfoBox');
+  const staIpVal = document.getElementById('staIpValue');
+  const staLink = document.getElementById('staDirectLink');
+  if (staInfoBox && staIpVal) {
+    if (farmState.staConnected && farmState.staIP && farmState.staIP !== '0.0.0.0') {
+      staInfoBox.style.display = 'block';
+      staIpVal.textContent = farmState.staIP;
+      if (staLink) staLink.href = `http://${farmState.staIP}`;
+      localStorage.setItem('samposhi_sta_ip', farmState.staIP);
+    } else {
+      staInfoBox.style.display = 'none';
     }
   }
 
@@ -1381,7 +1468,18 @@ function openRemoteConnectionModal() {
   if (userEl) userEl.value = farmState.mqttUser || localStorage.getItem('samposhi_mqtt_user') || "";
   if (passEl) passEl.value = localStorage.getItem('samposhi_mqtt_pass') || "";
   if (enEl) enEl.checked = farmState.mqttEnabled !== false;
-  if (localIpEl) localIpEl.value = localStorage.getItem('samposhi_local_ip') || '192.168.4.1';
+  if (localIpEl) localIpEl.value = getTargetGatewayHost();
+  const staPresetBtn = document.getElementById('btnPresetStaIp');
+  if (staPresetBtn) {
+    const staIp = (farmState.staIP || localStorage.getItem('samposhi_sta_ip') || '').trim();
+    if (staIp && staIp !== '0.0.0.0') {
+      staPresetBtn.style.display = 'inline-block';
+      staPresetBtn.textContent = `Farm Wi-Fi (${staIp})`;
+      staPresetBtn.onclick = () => setModalLocalIpPreset(staIp);
+    } else {
+      staPresetBtn.style.display = 'none';
+    }
+  }
 
   // Sync mode pills and sections
   const mode = farmState.connectionMode || 'remote';
@@ -1393,7 +1491,7 @@ function openRemoteConnectionModal() {
   const terminal = document.getElementById('remoteTerminalLogs');
   if (terminal && terminal.children.length === 0) {
     logRemoteTerminal("Terminal initialized.", "sys");
-    const savedIp = localStorage.getItem('samposhi_local_ip') || '192.168.4.1';
+    const savedIp = getTargetGatewayHost();
     logRemoteTerminal(`Local Gateway: http://${savedIp}`, "ok");
     logRemoteTerminal(`Target Broker: ${farmState.mqttBroker || 'broker.emqx.io'}:${farmState.mqttPort || 1883}`, "net");
     logRemoteTerminal(`Resolved WS URL: ${getMqttWsUrl()}`, "net");
@@ -1406,6 +1504,31 @@ function openRemoteConnectionModal() {
     } else {
       logRemoteTerminal(`Status: ${farmState.connectionMode === 'remote' ? 'CONNECTING...' : 'DISCONNECTED'}`, "warn");
     }
+  }
+}
+
+function setModalLocalIpPreset(ip) {
+  let targetIp = ip;
+  if (!targetIp) {
+    targetIp = (farmState.staIP || localStorage.getItem('samposhi_sta_ip') || '').trim();
+  }
+  const ipInput = document.getElementById('modalLocalGatewayIp');
+  if (ipInput && targetIp) {
+    ipInput.value = targetIp;
+    ipInput.focus();
+  }
+}
+
+function applyStaIpAsGateway() {
+  const staIp = (farmState.staIP || localStorage.getItem('samposhi_sta_ip') || '').trim();
+  if (staIp && staIp !== '0.0.0.0') {
+    activeWorkingGatewayHost = staIp;
+    localStorage.setItem('samposhi_local_ip', staIp);
+    const ipInput = document.getElementById('modalLocalGatewayIp');
+    if (ipInput) ipInput.value = staIp;
+    if (typeof showToast === 'function') showToast(`Gateway switched to Farm Router IP: ${staIp}`);
+    fetchStatus(true);
+    renderSettingsTab();
   }
 }
 
@@ -1463,8 +1586,10 @@ async function saveAndConnectRemoteModal() {
   if (farmState.connectionMode === 'local') {
     const ipInput = document.getElementById('modalLocalGatewayIp');
     if (ipInput) {
-      const val = ipInput.value.trim() || '192.168.4.1';
+      let val = (ipInput.value || '').trim() || '192.168.4.1';
+      val = val.replace(/^https?:\/\//, '').replace(/\/$/, '');
       localStorage.setItem('samposhi_local_ip', val);
+      activeWorkingGatewayHost = val;
       logRemoteTerminal(`Gateway IP configured to: http://${val}`, "ok");
       showToast(`Gateway IP set to ${val}`);
     }
