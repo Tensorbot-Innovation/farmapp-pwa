@@ -1,0 +1,12 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "com.samposhi.farm.twa",
+      "sha256_cert_fingerprints": [
+        "14:6D:E9:7D:0C:5F:6C:A7:A6:10:7B:48:C7:2E:7C:F4:79:33:04:8E:77:E5:A9:72:08:4D:45:90:FD:47:67:EE"
+      ]
+    }
+  }
+]

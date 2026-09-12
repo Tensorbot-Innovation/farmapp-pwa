@@ -474,6 +474,10 @@ window.fetch = async function(url, options) {
       sendCloudMqttCommand({ cmd: "reboot" });
     } else if (url.includes('/api/reset')) {
       sendCloudMqttCommand({ cmd: "reset" });
+    } else if (url.includes('/api/master/ota-url')) {
+      sendCloudMqttCommand({ cmd: "ota_master_url", url: body.url });
+    } else if (url.includes('/api/slave/ota-url')) {
+      sendCloudMqttCommand({ cmd: "ota_slave_url", nodeId: body.nodeId, url: body.url });
     }
 
     return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
@@ -1287,19 +1291,49 @@ async function saveFarmWifiConfig() {
   const rSsid = document.getElementById('cfgRouterSSID').value.trim();
   const rPass = document.getElementById('cfgRouterPass').value;
 
+  // 1. Validation: If enabled, SSID must not be blank
+  if (staEn && !rSsid) {
+    showToast("Please enter Farm WiFi SSID", true);
+    const ssidInput = document.getElementById('cfgRouterSSID');
+    if (ssidInput) ssidInput.focus();
+    return;
+  }
+
   const payload = {
     staEnabled: staEn,
     routerSSID: rSsid
   };
+
+  // 2. Check if user changed the SSID
+  const prevSsid = (farmState.routerSSID || '').trim();
+  const isNewSsid = (rSsid !== prevSsid);
+
   if (rPass.length > 0) {
+    // User provided a password
     payload.routerPass = rPass;
+  } else if (isNewSsid && staEn) {
+    // New SSID entered with empty password field
+    const isOpenNet = confirm(`No password entered for "${rSsid}". Is this an open Wi-Fi network without a password?`);
+    if (!isOpenNet) {
+      const passInput = document.getElementById('cfgRouterPass');
+      if (passInput) passInput.focus();
+      showToast("Please enter the Wi-Fi password", true);
+      return;
+    }
+    // Explicitly send empty string so Master clears old password for open network
+    payload.routerPass = "";
   }
 
   farmState.staEnabled = staEn;
   farmState.routerSSID = rSsid;
+  if (staEn) {
+    farmState.staConnected = false; // Optimistic update: show Connecting state immediately
+  }
 
   renderSettingsTab();
   renderHeroBanners();
+
+  showToast(staEn ? "Connecting to Farm WiFi..." : "Disabling Farm WiFi...");
 
   try {
     const res = await fetch('/api/config', {
@@ -1308,11 +1342,18 @@ async function saveFarmWifiConfig() {
       body: JSON.stringify(payload)
     });
     if (res.ok) {
-      showToast("Farm Internet WiFi saved to Master!");
+      showToast(staEn ? "Farm WiFi settings saved! Connecting..." : "Farm WiFi disabled");
     } else {
       showToast("Failed to save to master", true);
     }
-    await fetchStatus();
+    // Clear password input field after submission for security
+    const passInput = document.getElementById('cfgRouterPass');
+    if (passInput) passInput.value = "";
+
+    // Poll status quickly to reflect the newly acquired IP and active connection
+    setTimeout(fetchStatus, 2000);
+    setTimeout(fetchStatus, 5000);
+    setTimeout(fetchStatus, 10000);
   } catch (e) {
     showToast("Farm Internet WiFi saved locally");
   }
@@ -3192,15 +3233,146 @@ function uploadSlaveFirmware() {
   xhr.send(formData);
 }
 
+async function flashMasterFromCloudUrl() {
+  const urlInp = document.getElementById('masterCloudOtaUrlInput');
+  const btn = document.getElementById('btnMasterCloudOta');
+  const statusDiv = document.getElementById('masterCloudOtaStatus');
+  const url = urlInp ? urlInp.value.trim() : '';
+
+  if (!url || !url.startsWith('http')) {
+    showToast("Please enter a valid HTTP or HTTPS firmware .bin URL", true);
+    return;
+  }
+
+  if (!confirm(`Download and flash Master firmware from:\n${url}\n\nGateway will download over farm Wi-Fi and reboot.`)) return;
+
+  btn.disabled = true;
+  btn.textContent = "⏳ Dispatching Cloud OTA...";
+  if (statusDiv) {
+    statusDiv.style.display = 'block';
+    statusDiv.style.color = 'var(--text-muted)';
+    statusDiv.innerHTML = `<b>☁ Dispatching update request...</b> Master Gateway downloading from cloud.`;
+  }
+
+  try {
+    const res = await fetch('/api/master/ota-url', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: url })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      if (statusDiv) {
+        statusDiv.style.color = '#10B981';
+        statusDiv.innerHTML = `<b>✅ Flash Succeeded!</b> Master Gateway is now rebooting...`;
+      }
+      showToast("Master Cloud OTA Success! Rebooting...", false);
+      btn.textContent = "✅ Update Complete";
+      setTimeout(() => { window.location.reload(); }, 8000);
+    } else {
+      btn.disabled = false;
+      btn.textContent = "Update Master from Cloud";
+      if (statusDiv) {
+        statusDiv.style.color = '#EF4444';
+        statusDiv.innerHTML = `<b>❌ Failed:</b> ${data.msg || "Check serial console."}`;
+      }
+      showToast(data.msg || "Master Cloud OTA failed", true);
+    }
+  } catch (e) {
+    if (activeMode === 'cloud') {
+      showToast("Cloud OTA command dispatched via MQTT broker", false);
+      btn.textContent = "📡 Dispatched to Cloud";
+      if (statusDiv) {
+        statusDiv.style.color = '#3B82F6';
+        statusDiv.innerHTML = `<b>📡 Dispatched via Cloud MQTT.</b> Master is downloading and flashing.`;
+      }
+    } else {
+      btn.disabled = false;
+      btn.textContent = "Update Master from Cloud";
+      if (statusDiv) {
+        statusDiv.style.color = '#EF4444';
+        statusDiv.innerHTML = `<b>❌ Error:</b> Network timeout or disconnect.`;
+      }
+      showToast("Failed to communicate with Gateway", true);
+    }
+  }
+}
+
 async function flashSlaveFromCloudUrl() {
   const nodeId = parseInt(document.getElementById('slaveOtaTargetNode').value, 10);
   const urlInp = document.getElementById('slaveOtaUrlInput');
+  const btn = document.getElementById('btnSlaveCloudOta');
+  const statusDiv = document.getElementById('slaveCloudOtaStatus');
   const url = urlInp ? urlInp.value.trim() : '';
+
   if (!url || !url.startsWith('http')) {
-    showToast("Please enter a valid HTTP/HTTPS firmware .bin URL", true);
+    showToast("Please enter a valid HTTP or HTTPS firmware .bin URL", true);
     return;
   }
-  showToast(`Cloud update dispatched for Fixture #${nodeId}`);
+
+  if (!confirm(`Flash Fixture #${nodeId} from Cloud URL:\n${url}?`)) return;
+
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "⏳ Downloading & Flashing...";
+  }
+  if (statusDiv) {
+    statusDiv.style.display = 'block';
+    statusDiv.style.color = 'var(--text-muted)';
+    statusDiv.innerHTML = `<b>☁ Streaming firmware to Fixture #${nodeId}...</b> Please wait.`;
+  }
+
+  try {
+    const res = await fetch('/api/slave/ota-url', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nodeId: nodeId, url: url })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      if (statusDiv) {
+        statusDiv.style.color = '#10B981';
+        statusDiv.innerHTML = `<b>✅ Success!</b> Fixture #${nodeId} updated successfully.`;
+      }
+      if (btn) btn.textContent = "✅ Fixture Updated";
+      showToast(`Fixture #${nodeId} updated successfully!`, false);
+      setTimeout(() => {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = "Update Fixture from Cloud";
+        }
+      }, 4000);
+    } else {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = "Update Fixture from Cloud";
+      }
+      if (statusDiv) {
+        statusDiv.style.color = '#EF4444';
+        statusDiv.innerHTML = `<b>❌ Failed:</b> ${data.msg || "Check console"}`;
+      }
+      showToast(data.msg || "Fixture Cloud OTA failed", true);
+    }
+  } catch (e) {
+    if (activeMode === 'cloud') {
+      showToast(`Cloud OTA command dispatched for Fixture #${nodeId}`, false);
+      if (btn) btn.textContent = "📡 Dispatched to Cloud";
+      if (statusDiv) {
+        statusDiv.style.color = '#3B82F6';
+        statusDiv.innerHTML = `<b>📡 Dispatched via Cloud MQTT.</b> Master is downloading & streaming to fixture.`;
+      }
+    } else {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = "Update Fixture from Cloud";
+      }
+      if (statusDiv) {
+        statusDiv.style.color = '#EF4444';
+        statusDiv.innerHTML = `<b>❌ Error:</b> Network error or gateway busy.`;
+      }
+      showToast("Network error communicating with Gateway", true);
+    }
+  }
 }
 
 async function strobeNode(nodeId) {

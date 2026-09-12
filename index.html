@@ -520,7 +520,7 @@
       <section class="settings-section-card">
         <div class="settings-section-header">
           <div class="settings-title-group">
-            <span class="settings-section-title">Calibrate the Master LDR Sensor</span>
+            <span class="settings-section-title">Calibrate Light Sensor</span>
           </div>
           <span class="status-pill online" id="calibSensorBadge">
             <span class="status-dot-pulse"></span>
@@ -576,11 +576,11 @@
           </div>
         </div>
 
-        <div style="display: flex; gap: 10px;">
-          <button class="btn-purple-primary" onclick="saveManualLdrCalibration()" style="flex: 2;">
+        <div style="display: flex; gap: 10px; align-items: center; margin-top: 12px; margin-bottom: 24px;">
+          <button class="btn-purple-primary" onclick="saveManualLdrCalibration()" style="flex: 1; margin: 0; height: 48px;">
             Save Calibration
           </button>
-          <button class="btn-action-pill" onclick="resetLdrCalibrationDefaults()" style="flex: 1; justify-content: center;" title="Reset to 1000 and 3500 defaults">
+          <button type="button" class="btn-action-pill" onclick="resetLdrCalibrationDefaults()" style="margin: 0; height: 48px; padding: 0 16px; min-width: 80px; flex: 0 0 auto; justify-content: center; font-weight: 600;" title="Reset to 1000 and 3500 defaults">
             Reset
           </button>
         </div>
@@ -700,14 +700,9 @@
             <span style="color: var(--text-muted);">Local mDNS URL:</span>
             <span style="font-family: var(--font-mono); font-weight: 600; color: var(--text-main);">http://samposhi.local</span>
           </div>
-          <div style="display: grid; grid-template-columns: 1fr auto; gap: 8px;">
-            <button type="button" class="btn-purple-primary" style="padding: 7px 10px; font-size: 0.74rem; font-weight: 500; justify-content: center; height: auto;" onclick="applyStaIpAsGateway()">
-              Switch Gateway to Router IP
-            </button>
-            <a id="staDirectLink" href="#" target="_blank" class="device-card-white" style="text-decoration: none; padding: 7px 12px; font-size: 0.74rem; font-weight: 600; display: flex; align-items: center; justify-content: center; height: auto;">
-              Open in Browser
-            </a>
-          </div>
+          <button type="button" class="btn-purple-primary" style="margin: 0; padding: 10px 14px; font-size: 0.8rem; font-weight: 600; justify-content: center; height: 44px; width: 100%;" onclick="applyStaIpAsGateway()">
+            Switch Gateway to Router IP
+          </button>
         </div>
 
         <button class="btn-purple-primary" onclick="saveFarmWifiConfig()">
@@ -830,7 +825,7 @@
               <div class="ota-status-txt text-light" id="otaStatusText">Uploading firmware binary...</div>
             </div>
 
-            <button class="btn-purple-primary" id="otaUploadBtn" style="margin-top: 12px;" onclick="uploadOtaFirmware()">
+            <button class="btn-purple-primary" id="otaUploadBtn" style="margin-top: 12px; margin-bottom: 0;" onclick="uploadOtaFirmware()">
               <svg class="outline-icon outline-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                 <path fill="currentColor" stroke="none" fill-rule="evenodd" d="M 10.74 6.54 L 13.26 6.54 L 13.21 8.29 L 14.61 9.10 L 16.10 8.18 L 17.36 10.36 L 15.81 11.19 L 15.81 12.81 L 17.36 13.64 L 16.10 15.82 L 14.61 14.90 L 13.21 15.71 L 13.26 17.46 L 10.74 17.46 L 10.79 15.71 L 9.39 14.90 L 7.90 15.82 L 6.64 13.64 L 8.19 12.81 L 8.19 11.19 L 6.64 10.36 L 7.90 8.18 L 9.39 9.10 L 10.79 8.29 Z M 12 10 A 2 2 0 1 0 12 14 A 2 2 0 1 0 12 10 Z"></path>
                 <path d="M 5.2 15.2 A 8.6 8.6 0 0 1 18.6 7.6"></path>
@@ -840,6 +835,22 @@
               </svg>
               <span>Upload & Flash Firmware</span>
             </button>
+
+            <!-- Cloud OTA Update for Master -->
+            <div class="ota-step-card" style="margin-top: 16px; margin-bottom: 0;">
+              <div class="ota-step-header">
+                <div class="ota-step-num" style="background: #3B82F6;">☁</div>
+                <div class="ota-step-title">Cloud OTA Update</div>
+              </div>
+              <p style="font-size: 0.74rem; color: var(--text-muted); line-height: 1.4; margin-bottom: 8px;">
+                Master downloads firmware binary directly from an HTTP/HTTPS URL.
+              </p>
+              <input type="url" id="masterCloudOtaUrlInput" class="styled-input" placeholder="https://domain.com/Master_v2.ino.bin" style="font-family: var(--font-mono); font-size: 0.78rem; margin-bottom: 8px;">
+              <button type="button" class="btn-action-pill" id="btnMasterCloudOta" onclick="flashMasterFromCloudUrl()" style="width: 100%; justify-content: center; font-weight: 600;">
+                Update Master from Cloud
+              </button>
+              <div id="masterCloudOtaStatus" style="font-size: 0.76rem; margin-top: 8px; display: none;"></div>
+            </div>
           </div>
         </div>
       </section>
@@ -1334,19 +1345,20 @@
         </button>
       </div>
 
-      <!-- Cloud URL OTA -->
+      <!-- Cloud OTA Update for Fixture -->
       <div class="ota-step-card" style="margin-bottom: 0;">
         <div class="ota-step-header">
           <div class="ota-step-num" style="background: #3B82F6;">☁</div>
-          <div class="ota-step-title">Cloud URL 1-Click Update</div>
+          <div class="ota-step-title">Cloud OTA Update</div>
         </div>
         <p style="font-size: 0.74rem; color: var(--text-muted); line-height: 1.4; margin-bottom: 8px;">
           Master downloads .bin over farm Wi-Fi and flashes fixture over radio.
         </p>
-        <input type="url" id="slaveOtaUrlInput" class="styled-input" placeholder="https://domain.com/firmware/Slave_v2.ino.bin" style="font-family: var(--font-mono); font-size: 0.78rem; margin-bottom: 8px;">
-        <button class="btn-action-pill" onclick="flashSlaveFromCloudUrl()" style="width: 100%; justify-content: center;">
-          Flash From Cloud URL
+        <input type="url" id="slaveOtaUrlInput" class="styled-input" placeholder="https://domain.com/Slave_v2.ino.bin" style="font-family: var(--font-mono); font-size: 0.78rem; margin-bottom: 8px;">
+        <button type="button" class="btn-action-pill" id="btnSlaveCloudOta" onclick="flashSlaveFromCloudUrl()" style="width: 100%; justify-content: center; font-weight: 600;">
+          Update Fixture from Cloud
         </button>
+        <div id="slaveCloudOtaStatus" style="font-size: 0.76rem; margin-top: 8px; display: none;"></div>
       </div>
     </div>
   </div>
